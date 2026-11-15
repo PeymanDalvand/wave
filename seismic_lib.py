@@ -354,6 +354,10 @@ class AcousticWaveSolver2D:
     pure-Python finite-difference operator library, instead of hand-written
     array slicing -- this keeps the numerical scheme declarative and makes
     the accuracy order trivially tunable via ``space_order``.
+
+    All four edges use first-order Mur outgoing-wave conditions. A tapered
+    damping layer solves ``u_tt + 2*sigma*u_t = v^2*Laplacian(u)`` to reduce
+    oblique-incidence reflections before waves reach the outer edges.
     """
 
     nz: int
@@ -370,6 +374,9 @@ class AcousticWaveSolver2D:
         self.u_prev = np.zeros((self.nz, self.nx))
         self.u_curr = np.zeros((self.nz, self.nx))
         self.damping_mask = self._build_sponge_mask()
+        self._damping_dt = -np.log(self.damping_mask)
+        courant = self.velocity * self.dt / self.dx
+        self._mur_coefficient = (courant - 1.0) / (courant + 1.0)
         self.time_step = 0
 
     def _build_sponge_mask(self) -> np.ndarray:
@@ -390,11 +397,41 @@ class AcousticWaveSolver2D:
     def advance(self) -> np.ndarray:
         """Step the wavefield forward by one ``dt`` and return the new state."""
         laplacian = self._laplacian(self.u_curr)
-        u_next = 2 * self.u_curr - self.u_prev + (self.velocity * self.dt) ** 2 * laplacian
-        u_next *= self.damping_mask
+        u_next = (
+            2 * self.u_curr
+            - (1 - self._damping_dt) * self.u_prev
+            + (self.velocity * self.dt) ** 2 * laplacian
+        ) / (1 + self._damping_dt)
+        self._apply_outgoing_boundary(u_next)
         self.u_prev, self.u_curr = self.u_curr, u_next
         self.time_step += 1
         return self.u_curr
+
+    def _apply_outgoing_boundary(self, u_next: np.ndarray) -> None:
+        """Mur's one-way condition, with both outward normals at each corner."""
+        current = self.u_curr
+        coefficient = self._mur_coefficient
+        u_next[0, 1:-1] = current[1, 1:-1] + coefficient[0, 1:-1] * (
+            u_next[1, 1:-1] - current[0, 1:-1]
+        )
+        u_next[-1, 1:-1] = current[-2, 1:-1] + coefficient[-1, 1:-1] * (
+            u_next[-2, 1:-1] - current[-1, 1:-1]
+        )
+        u_next[1:-1, 0] = current[1:-1, 1] + coefficient[1:-1, 0] * (
+            u_next[1:-1, 1] - current[1:-1, 0]
+        )
+        u_next[1:-1, -1] = current[1:-1, -2] + coefficient[1:-1, -1] * (
+            u_next[1:-1, -2] - current[1:-1, -1]
+        )
+        for row, neighbor_row in ((0, 1), (-1, -2)):
+            for col, neighbor_col in ((0, 1), (-1, -2)):
+                outgoing_z = current[neighbor_row, col] + coefficient[row, col] * (
+                    u_next[neighbor_row, col] - current[row, col]
+                )
+                outgoing_x = current[row, neighbor_col] + coefficient[row, col] * (
+                    u_next[row, neighbor_col] - current[row, col]
+                )
+                u_next[row, col] = 0.5 * (outgoing_z + outgoing_x)
 
 
 # ---------------------------------------------------------------------------
